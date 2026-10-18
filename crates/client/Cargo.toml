@@ -1,0 +1,18 @@
+[package]
+name = "lindesk-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+gstreamer.workspace = true
+gstreamer-app.workspace = true
+gstreamer-video.workspace = true
+lindesk-proto.workspace = true
+winit = "0.30"
+softbuffer = "0.4"
+socket2 = "0.5"

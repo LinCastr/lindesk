@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use lindesk_proto::events::ViewerEvent;
 use lindesk_proto::{Channel, InputEvent, Msg, Reassembler, Side, VERSION};
 use socket2::{Domain, Socket, Type};
 
@@ -65,9 +66,10 @@ impl Session {
     }
 
     /// Spawns the receive and keepalive threads. Frames go to `decode`.
-    pub fn run(self: &Arc<Self>, decode: Arc<Decode>) {
+    pub fn run(self: &Arc<Self>, decode: Arc<Decode>, emit: Arc<dyn Fn(ViewerEvent) + Send + Sync>) {
         // Receiver
         let me = self.clone();
+        let emit_rx = emit.clone();
         let stats = Arc::new(Mutex::new((0u32, 0u32))); // (ok, lost) since last report
         let st = stats.clone();
         std::thread::Builder::new()
@@ -85,7 +87,9 @@ impl Session {
                     let Ok(msg) = me.chan.lock().unwrap().open(&buf[..n]) else { continue };
                     match msg {
                         Msg::Video(shard) => {
-                            me.connected.store(true, Ordering::Relaxed);
+                            if !me.connected.swap(true, Ordering::Relaxed) {
+                                emit_rx(ViewerEvent::Connected);
+                            }
                             me.last_video_us.store(me.now_us(), Ordering::Relaxed);
                             let out = re.push(shard);
                             if let Some(f) = out.frame {
@@ -115,13 +119,12 @@ impl Session {
         std::thread::Builder::new()
             .name("net-tick".into())
             .spawn(move || {
-                let mut tick = 0u64;
                 while !me.stop.load(Ordering::Relaxed) {
                     // Video silent for 3 s (host restarted or link died): handshake again.
                     if me.connected.load(Ordering::Relaxed)
                         && me.now_us().saturating_sub(me.last_video_us.load(Ordering::Relaxed)) > 3_000_000
                     {
-                        log::warn!("no video for 3s, reconnecting");
+                        emit(ViewerEvent::Reconnecting);
                         me.connected.store(false, Ordering::Relaxed);
                     }
                     if !me.connected.load(Ordering::Relaxed) {
@@ -133,11 +136,11 @@ impl Session {
                     me.send(&Msg::Ping(me.now_us()));
                     let (ok, lost) = std::mem::take(&mut *stats.lock().unwrap());
                     me.send(&Msg::Stats { frames_ok: ok, frames_lost: lost });
-                    tick += 1;
-                    log::info!(
-                        "t={tick}s fps={ok} lost={lost} rtt={:.1}ms",
-                        me.rtt_us.load(Ordering::Relaxed) as f64 / 1000.0
-                    );
+                    emit(ViewerEvent::Stats {
+                        fps: ok,
+                        lost,
+                        rtt_ms: me.rtt_us.load(Ordering::Relaxed) as f32 / 1000.0,
+                    });
                     std::thread::sleep(Duration::from_secs(1));
                 }
             })

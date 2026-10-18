@@ -1,0 +1,32 @@
+[package]
+name = "lindesk-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Low-latency remote desktop with a Wayland host"
+
+[[bin]]
+name = "lindesk"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+gstreamer.workspace = true
+lindesk-proto.workspace = true
+lindesk-host = { path = "../host" }
+lindesk-client = { path = "../client" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+if-addrs = "0.15"
+ureq = { version = "3", features = ["json"] }
+minisign-verify = "0.3"
+iced = { version = "0.14", default-features = false, features = [
+    "wgpu", "tiny-skia", "crisp", "thread-pool", "x11", "wayland", "tokio", "svg", "image",
+] }
+
+[dev-dependencies]
+minisign = "0.7"

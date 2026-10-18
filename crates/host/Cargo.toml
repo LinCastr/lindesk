@@ -4,11 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "lindesk_host"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 log.workspace = true
-env_logger.workspace = true
 gstreamer.workspace = true
 gstreamer-app.workspace = true
 gstreamer-video.workspace = true

@@ -1,0 +1,59 @@
+name: Release
+
+# Push a tag like v0.1.1 to publish. The tag must match the version in Cargo.toml.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches Cargo.toml
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')"
+          [ "$want" = "$have" ] || { echo "tag $want != workspace version $have"; exit 1; }
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release -p lindesk-app
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/release/lindesk dist/lindesk-linux-x86_64
+          strip dist/lindesk-linux-x86_64
+          cp crates/app/assets/icon.png dist/lindesk.png
+          cp install.sh dist/install.sh
+
+      - name: Sign
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          printf '%s' "$MINISIGN_KEY" > "$RUNNER_TEMP/release.key"
+          cargo run --release --manifest-path tools/sign/Cargo.toml -- "$RUNNER_TEMP/release.key" dist/lindesk-linux-x86_64
+          rm -f "$RUNNER_TEMP/release.key"
+          (cd dist && sha256sum lindesk-linux-x86_64 lindesk.png install.sh > SHA256SUMS)
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --title "lindesk $GITHUB_REF_NAME" --generate-notes

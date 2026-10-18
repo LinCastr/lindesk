@@ -1,0 +1,10 @@
+[package]
+name = "sign"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone build tool, not part of the app workspace.
+[workspace]
+
+[dependencies]
+minisign = "0.7"

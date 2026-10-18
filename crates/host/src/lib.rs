@@ -1,143 +1,102 @@
 mod inject;
 mod net;
 mod pipeline;
-mod portal;
+pub mod portal;
+
+pub use pipeline::Encoder;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::Parser;
-use lindesk_proto::{Msg, VERSION, generate_key, parse_key};
+use lindesk_proto::events::HostEvent;
+use lindesk_proto::{Msg, VERSION};
 
 use net::Net;
-use pipeline::{Encoder, Settings, Source, Streamer};
-
-#[derive(Parser)]
-#[command(about = "lindesk host: shares this Wayland screen with one authenticated client")]
-struct Args {
-    /// UDP address to listen on.
-    #[arg(long, default_value = "0.0.0.0:7000")]
-    listen: SocketAddr,
-    /// File holding the 64-hex-char pre-shared key (created on first run).
-    #[arg(long)]
-    key_file: Option<PathBuf>,
-    /// portal | test | node:<pipewire-node-id>
-    #[arg(long, default_value = "portal")]
-    source: String,
-    #[arg(long, value_enum, default_value = "auto")]
-    encoder: Encoder,
-    #[arg(long, default_value_t = 60)]
-    fps: u32,
-    /// Maximum (and initial) bitrate in kbit/s; lowered automatically on loss.
-    #[arg(long, default_value_t = 20_000)]
-    bitrate: u32,
-    /// Do not draw the cursor into the video.
-    #[arg(long)]
-    no_cursor: bool,
-    /// Do not accept keyboard/mouse input from the client.
-    #[arg(long)]
-    no_input: bool,
-    /// Forget the remembered screen/window choice and exit.
-    #[arg(long)]
-    forget_screen: bool,
-}
+use pipeline::{Settings, Source, Streamer};
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_KBPS: u32 = 2_000;
 
-fn load_key(path: Option<PathBuf>) -> Result<[u8; 32]> {
-    let path = match path {
-        Some(p) => p,
-        None => directories::ProjectDirs::from("", "", "lindesk")
-            .context("no home directory")?
-            .config_dir()
-            .join("key"),
-    };
-    if !path.exists() {
-        if let Some(d) = path.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        std::fs::write(&path, generate_key() + "\n")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        log::info!("created new key at {}", path.display());
-    }
-    let text = std::fs::read_to_string(&path)?;
-    eprintln!("key file: {}  (give its content to the client with --key)", path.display());
-    parse_key(&text)
+
+pub struct Options {
+    pub listen: SocketAddr,
+    pub key: [u8; 32],
+    /// portal | test | node:<pipewire-node-id>
+    pub source: String,
+    pub encoder: Encoder,
+    pub fps: u32,
+    /// Maximum (and initial) bitrate in kbit/s; lowered automatically on loss.
+    pub bitrate: u32,
+    pub cursor: bool,
+    pub input: bool,
 }
 
-fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let args = Args::parse();
-    if args.forget_screen {
-        portal::forget_choice();
-        return Ok(());
-    }
-    let key = load_key(args.key_file.clone())?;
-    let net = Arc::new(Net::bind(args.listen, &key)?);
+/// Runs the host until `stop` is set. Blocks.
+pub fn run(opts: Options, stop: Arc<AtomicBool>, emit: impl Fn(HostEvent)) -> Result<()> {
+    let net = Arc::new(Net::bind(opts.listen, &opts.key)?);
 
     // Keep the portal session alive for the whole run; dropping it ends the capture.
     let mut _portal = None;
-    let source = match args.source.as_str() {
+    let source = match opts.source.as_str() {
         "test" => Source::Test,
         "portal" => {
-            let p = portal::open(!args.no_cursor)?;
+            let p = portal::open(opts.cursor)?;
             let fd = Arc::new(p.fd.try_clone()?);
             let node = p.node;
             _portal = Some(p);
             Source::Portal { fd, node }
         }
-        s => Source::Node(s.strip_prefix("node:").and_then(|n| n.parse().ok()).context("--source: portal | test | node:<id>")?),
+        s => Source::Node(s.strip_prefix("node:").and_then(|n| n.parse().ok()).context("source: portal | test | node:<id>")?),
     };
 
     let streamer = Streamer::new(
         net.clone(),
         source,
-        Settings { encoder: args.encoder, fps: args.fps, kbps: args.bitrate },
+        Settings { encoder: opts.encoder, fps: opts.fps, kbps: opts.bitrate },
     )?;
-    let mut injector = if args.no_input {
-        None
-    } else {
+    let mut injector = if opts.input {
         match inject::Injector::new() {
             Ok(i) => Some(i),
             Err(e) => {
-                log::warn!("input injection disabled: {e:#}");
+                emit(HostEvent::Error { message: format!("Input control unavailable: {e:#}") });
                 None
             }
         }
+    } else {
+        None
     };
 
-    log::info!("listening on {}", args.listen);
+    emit(HostEvent::Listening { addr: opts.listen.to_string(), encoder: format!("{:?}", streamer.encoder()) });
     let mut buf = vec![0u8; lindesk_proto::MAX_DATAGRAM];
     let mut last_rx = Instant::now();
-    let mut kbps = args.bitrate;
+    let mut last_stats = Instant::now();
+    let mut kbps = opts.bitrate;
     let mut calm = 0u32;
 
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         match net.sock.recv_from(&mut buf) {
             Ok((n, from)) => {
                 let Ok(msg) = net.open(&buf[..n]) else { continue }; // forged/replayed: drop silently
+                if matches!(msg, Msg::Bye) && net.peer().is_none() {
+                    continue; // the client sends Bye several times; only the first counts
+                }
                 last_rx = Instant::now();
                 // Authenticated packet: follow the peer even if its address changed.
                 if net.peer() != Some(from) {
-                    log::info!("client at {from}");
+                    emit(HostEvent::ClientConnected { addr: from.to_string() });
                     net.set_peer(Some(from));
                 }
                 match msg {
                     Msg::Hello { version } => {
                         if version != VERSION {
-                            log::warn!("client protocol {version} != {VERSION}");
+                            emit(HostEvent::Error { message: format!("client protocol {version} != {VERSION}") });
                         }
                         if let Err(e) = streamer.start() {
-                            log::error!("cannot start streaming: {e:#}");
+                            emit(HostEvent::Error { message: format!("cannot start streaming: {e:#}") });
                         }
                         streamer.force_keyframe();
                     }
@@ -158,8 +117,8 @@ fn main() -> Result<()> {
                                 calm = 0;
                                 let f = net.fec_permille.load(Ordering::Relaxed);
                                 net.fec_permille.store(f.saturating_sub(50).max(net::DEFAULT_FEC), Ordering::Relaxed);
-                                if kbps < args.bitrate {
-                                    kbps = (kbps * 108 / 100).min(args.bitrate);
+                                if kbps < opts.bitrate {
+                                    kbps = (kbps * 108 / 100).min(opts.bitrate);
                                     streamer.set_bitrate(kbps);
                                 }
                             }
@@ -170,7 +129,10 @@ fn main() -> Result<()> {
                             inj.apply(seq, ev);
                         }
                     }
-                    Msg::Bye => disconnect(&streamer, &net, injector.as_mut()),
+                    Msg::Bye => {
+                        disconnect(&streamer, &net, injector.as_mut());
+                        emit(HostEvent::ClientLeft { reason: "disconnected".into() });
+                    }
                     Msg::Video(_) | Msg::Pong(_) => {}
                 }
             }
@@ -178,11 +140,21 @@ fn main() -> Result<()> {
             Err(e) => log::warn!("recv: {e}"),
         }
         if net.peer().is_some() && last_rx.elapsed() > SESSION_TIMEOUT {
-            log::info!("client timed out");
             disconnect(&streamer, &net, injector.as_mut());
-            kbps = args.bitrate;
+            emit(HostEvent::ClientLeft { reason: "timed out".into() });
+            kbps = opts.bitrate;
+        }
+        if net.peer().is_some() && last_stats.elapsed() >= Duration::from_secs(1) {
+            last_stats = Instant::now();
+            emit(HostEvent::Stats {
+                fps: net.frames_sent.swap(0, Ordering::Relaxed),
+                kbps,
+                fec_permille: net.fec_permille.load(Ordering::Relaxed),
+            });
         }
     }
+    disconnect(&streamer, &net, injector.as_mut());
+    Ok(())
 }
 
 fn disconnect(streamer: &Streamer, net: &Net, inj: Option<&mut inject::Injector>) {

@@ -18,6 +18,7 @@ use crate::session::Session;
 
 pub enum UserEvent {
     Frame,
+    Title(String),
 }
 
 const BTN_LEFT: u16 = 0x110;
@@ -113,7 +114,13 @@ impl ApplicationHandler<UserEvent> for App {
         self.window = Some(win);
     }
 
-    fn user_event(&mut self, _: &ActiveEventLoop, _: UserEvent) {
+    fn user_event(&mut self, _: &ActiveEventLoop, ev: UserEvent) {
+        if let UserEvent::Title(t) = ev {
+            if let Some(w) = &self.window {
+                w.set_title(&t);
+            }
+            return;
+        }
         let newest = self.latest.lock().unwrap().serial;
         if newest != self.shown {
             if let Some(w) = &self.window {

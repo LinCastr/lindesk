@@ -20,3 +20,12 @@ Workspace: `crates/proto` (wire format, AEAD, FEC, reassembly), `crates/host`, `
 - Entrada: uinput (precisa de escrita em `/dev/uinput`, grupo `input`). Mouse é absoluto 0..65535 sobre a tela capturada: só correto se a tela capturada for o desktop inteiro/monitor na origem (multi-monitor: pendente).
 - Chave pré-compartilhada de 32 bytes (hex) em `~/.config/lindesk/key` (0600). Sem chave válida o host ignora o pacote; replay é rejeitado por janela deslizante.
 - Não use `pkill -f`: casa com o próprio shell. Mate por PID.
+
+## App, atualizador e releases (v0.1+)
+- Binário único `lindesk` (crates/app): sem argumentos abre a janela iced; `host`/`view` são os processos filhos que a janela lança (eventos JSON no stdout, o host para quando o stdin fecha). Libs: `crates/host` (`lindesk_host::run`), `crates/client` (`lindesk_viewer::run`), `crates/proto`.
+- Código de conexão `LD-…` (proto/code.rs) = endereço + chave; é segredo. Config em `~/.config/lindesk/config.json` (0600).
+- Atualizador (`crates/app/src/update.rs`): GitHub API `releases/latest` → baixa `lindesk-linux-x86_64` + `.minisig` → verifica com a chave pública embutida (`PUBLIC_KEY`) → roda `--version` no novo → `rename` por cima do exe → `exec`. Só roda na abertura da janela, nunca durante sessão. `LINDESK_NO_UPDATE=1` desliga.
+- Release: tag `vX.Y.Z` igual à versão do `Cargo.toml` → `.github/workflows/release.yml` compila (ubuntu-22.04, libs do sistema, sem empacotar nada), assina com `tools/sign` e publica binário, `.minisig`, `SHA256SUMS`, `install.sh`, `lindesk.png`.
+- Segredos do repo: `MINISIGN_KEY` e `MINISIGN_PASSWORD`. Cópia local da chave privada e senha em `~/.config/lindesk-release/` (fora do repo, nunca comitar). Trocar a chave exige trocar `PUBLIC_KEY` no app e no `install.sh` e lançar uma versão que os usuários consigam instalar à mão (o atualizador antigo rejeita assinatura da chave nova).
+- Instalador: `install.sh` (curl | bash) instala em `~/.local/bin`, sem root, sem `ld.so`/`LD_LIBRARY_PATH`; confere SHA256 e, se houver `minisign`, a assinatura.
+- Nunca teste a janela com `--source portal` + input ligado em loopback: o cliente controla a própria tela.

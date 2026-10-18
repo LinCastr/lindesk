@@ -9,6 +9,9 @@
 //! access unit each; losing any fragment drops the whole frame (see
 //! [`Reassembler`]) because retransmitting is slower than the next frame.
 
+pub mod code;
+pub mod events;
+
 use std::collections::HashMap;
 
 use anyhow::{Result, bail, ensure};

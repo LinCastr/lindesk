@@ -17,6 +17,8 @@ pub struct Net {
     peer: Mutex<Option<SocketAddr>>,
     /// FEC parity shards per 1000 data shards; raised when the client reports loss.
     pub fec_permille: AtomicU32,
+    /// Frames sent since the last statistics report.
+    pub frames_sent: AtomicU32,
 }
 
 impl Net {
@@ -28,7 +30,7 @@ impl Net {
         s.bind(&addr.into())?;
         let sock: UdpSocket = s.into();
         sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
-        Ok(Self { sock, chan: Mutex::new(Channel::new(key, Side::Host)), peer: Mutex::new(None), fec_permille: AtomicU32::new(DEFAULT_FEC) })
+        Ok(Self { sock, chan: Mutex::new(Channel::new(key, Side::Host)), peer: Mutex::new(None), fec_permille: AtomicU32::new(DEFAULT_FEC), frames_sent: AtomicU32::new(0) })
     }
 
     pub fn peer(&self) -> Option<SocketAddr> {

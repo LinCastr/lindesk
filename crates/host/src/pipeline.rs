@@ -129,6 +129,10 @@ impl Streamer {
     }
 
 
+    pub fn encoder(&self) -> Encoder {
+        self.enc_kind
+    }
+
     pub fn start(&self) -> Result<()> {
         let mut slot = self.running.lock().unwrap();
         if slot.is_some() {
@@ -163,6 +167,7 @@ impl Streamer {
                     let map = buf.map_readable().map_err(|_| gst::FlowError::Error)?;
                     let key = !buf.flags().contains(gst::BufferFlags::DELTA_UNIT);
                     let n = frame_no.fetch_add(1, Ordering::Relaxed);
+                    net.frames_sent.fetch_add(1, Ordering::Relaxed);
                     let fec = net.fec_permille.load(Ordering::Relaxed);
                     net.send_all(&fragment(n, key, map.as_slice(), fec));
                     Ok(gst::FlowSuccess::Ok)

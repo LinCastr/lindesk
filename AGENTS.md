@@ -58,7 +58,17 @@ Se algo não estiver claro no meio da tarefa, pare e pergunte.
 - **Ações que podem impedir o boot ou o login** (driver, bootloader, gerenciador
   de login, serviços do sistema): avise antes, ofereça teste e peça confirmação.
 - **Não mate processo por padrão** (`pkill -f`): pode casar com o próprio shell do
-  agente. Mate por PID.
+  agente. Mate por PID (`pgrep -f` também casa com a linha do próprio comando: use
+  `pgrep -x nome` e confira `/proc/PID/exe`).
+- **Teste de janela/GUI nunca na workspace do usuário** (ele pode estar jogando ou
+  trabalhando). Abra numa workspace separada, sem trocar o foco:
+  `hyprctl dispatch "hl.dsp.exec_cmd('[workspace 9 silent] /caminho/script.sh')"`
+  (Hyprland 0.56 usa Lua; ponha o comando num script), e confirme com
+  `hyprctl clients -j` que a janela foi para lá. Mesmo assim, só teste GUI quando
+  precisar; prefira testes headless/CLI. Atenção: o app reiniciado pelo atualizador
+  (`exec`) abre janela nova na workspace **ativa**, então não teste o reinício do
+  atualizador com a janela real; use o teste local com servidor falso só até a troca
+  do binário.
 - Antes de apagar ou sobrescrever, olhe o alvo.
 
 ## 4. Comunicação

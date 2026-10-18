@@ -110,7 +110,7 @@ fn download(url: &str, limit: u64, progress: &dyn Fn(f32)) -> Result<Vec<u8>> {
 
 /// Downloads, verifies and installs `rel` over the running executable.
 pub fn install(rel: &Release, progress: &dyn Fn(f32)) -> Result<()> {
-    let exe = std::env::current_exe().context("cannot locate own executable")?;
+    let exe = installed_exe();
     let dir = exe.parent().context("executable has no directory")?;
     ensure!(
         is_writable(dir),
@@ -157,10 +157,19 @@ fn is_writable(dir: &Path) -> bool {
     ok
 }
 
+static EXE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Path of the running executable, captured on first use. It must be read
+/// before an update swaps the file: afterwards the kernel reports the old,
+/// renamed inode as "<path>.old (deleted)" and the path would be wrong.
+pub fn installed_exe() -> PathBuf {
+    EXE.get_or_init(|| std::env::current_exe().unwrap_or_else(|_| "lindesk".into())).clone()
+}
+
 /// Starts the freshly installed binary with the same arguments and ends this process.
 pub fn restart() -> ! {
     use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe().unwrap_or_else(|_| "lindesk".into());
+    let exe = installed_exe();
     let err = std::process::Command::new(exe).args(std::env::args_os().skip(1)).exec();
     eprintln!("could not restart: {err}");
     std::process::exit(1);

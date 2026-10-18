@@ -81,7 +81,7 @@ struct ViewArgs {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // Children are managed by the window and talk JSON on stdout; keep logs on stderr.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn,iced_wgpu=warn,winit=warn,zbus=warn,tracing=warn")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,iced_winit=warn,wgpu=warn,naga=warn,iced_wgpu=warn,winit=warn,zbus=warn,tracing=warn")).init();
     match cli.cmd {
         None => gui::run(),
         Some(Cmd::Host(a)) => run_host(a),

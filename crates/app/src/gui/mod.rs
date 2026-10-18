@@ -131,6 +131,7 @@ pub fn run() -> anyhow::Result<()> {
 
 impl App {
     fn new() -> (Self, Task<Msg>) {
+        update::installed_exe(); // remember where we live before any update swaps the file
         let cfg = Config::load();
         let (tx, rx) = channel();
         let routes = netinfo::local_routes();

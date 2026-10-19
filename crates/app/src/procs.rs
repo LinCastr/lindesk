@@ -3,12 +3,13 @@
 //! window always ends the session.
 
 use std::io::{BufRead, BufReader};
+use std::io::Write;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use lindesk_proto::events::{HostEvent, ViewerEvent, from_line};
+use lindesk_proto::events::{HostCommand, HostEvent, ViewerEvent, from_line, to_line};
 
 use crate::config::{self, Config};
 use crate::update::Release;
@@ -32,6 +33,14 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// Sends one command line to the child (host only).
+    pub fn command(&mut self, cmd: &HostCommand) {
+        if let Some(i) = self.stdin.as_mut() {
+            let _ = writeln!(i, "{}", to_line(cmd));
+            let _ = i.flush();
+        }
+    }
+
     /// Ask politely (stdin EOF); if it is still alive after a grace period, kill it.
     pub fn stop(mut self) {
         drop(self.stdin.take());
@@ -103,13 +112,17 @@ pub fn spawn_host(cfg: &Config, listen_port: u16, tx: Sender<Bus>) -> Result<Han
     if !cfg.allow_control {
         args.push("--no-input".into());
     }
-    spawn("host", args, vec![("LINDESK_KEY", cfg.host_key.clone())], tx, Bus::Host, Bus::HostExit)
+    spawn("host", args, vec![], tx, Bus::Host, Bus::HostExit)
 }
 
-pub fn spawn_viewer(cfg: &Config, code: &str, tx: Sender<Bus>) -> Result<Handle> {
-    let mut args = vec!["--decoder".into(), cfg.decoder.clone()];
+pub fn spawn_viewer(cfg: &Config, target: &str, pin: Option<String>, tx: Sender<Bus>) -> Result<Handle> {
+    let mut args = vec![target.to_string(), "--decoder".into(), cfg.decoder.clone(), "--name".into(), config::computer_name()];
+    if let Some(p) = pin {
+        args.push("--pin".into());
+        args.push(p);
+    }
     if cfg.fullscreen {
         args.push("--fullscreen".into());
     }
-    spawn("view", args, vec![("LINDESK_CODE", code.to_string())], tx, Bus::Viewer, Bus::ViewerExit)
+    spawn("view", args, vec![], tx, Bus::Viewer, Bus::ViewerExit)
 }

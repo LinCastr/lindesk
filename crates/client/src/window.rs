@@ -19,6 +19,7 @@ use crate::session::Session;
 pub enum UserEvent {
     Frame,
     Title(String),
+    Quit,
 }
 
 const BTN_LEFT: u16 = 0x110;
@@ -114,7 +115,11 @@ impl ApplicationHandler<UserEvent> for App {
         self.window = Some(win);
     }
 
-    fn user_event(&mut self, _: &ActiveEventLoop, ev: UserEvent) {
+    fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
+        if matches!(ev, UserEvent::Quit) {
+            el.exit();
+            return;
+        }
         if let UserEvent::Title(t) = ev {
             if let Some(w) = &self.window {
                 w.set_title(&t);

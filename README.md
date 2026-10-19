@@ -5,9 +5,9 @@ Share your screen and let someone control it, with a polished desktop app that u
 
 - **Wayland-native capture** through xdg-desktop-portal ScreenCast and PipeWire.
 - **Hardware H.264** (VA-API, NVENC) tuned for latency; x264 as fallback.
-- **UDP transport** with ChaCha20-Poly1305 encryption, Reed-Solomon FEC, and frame dropping instead of queuing, so it recovers from loss without lag piling up.
+- **UDP transport** with Noise (X25519, ChaCha20-Poly1305) encryption, Reed-Solomon FEC, and frame dropping instead of queuing, so it recovers from loss without lag piling up.
 - **Input control** through uinput, so it works on any compositor.
-- **One-code pairing:** the host shows a connection code; the other side pastes it.
+- **AnyDesk-style pairing:** a 10-digit ID, no accounts, no server; the host owner accepts each new computer.
 
 ## Install
 
@@ -23,18 +23,19 @@ To let the other person control your keyboard and mouse you need write access to
 
 ## Use
 
-1. On the computer to share: open lindesk → **Share this PC** → **Start sharing**, then **Copy code** and send it.
-2. On the other computer: open lindesk → **Connect**, paste the code, **Connect**. F11 toggles full screen.
+1. On the computer to share: open lindesk → **Share this PC** → **Start sharing**. It shows a 10-digit **ID**; tell it to the other person.
+2. On the other computer: open lindesk → **Connect**, type the ID, **Connect**.
+3. The first computer sees "X wants to connect": **Accept** (once), **Always allow** (that computer will not be asked again) or **Reject**. F11 toggles full screen in the viewer.
 
-Same network or VPN works out of the box. Over the internet, forward the UDP port (default 7000) to the host on your router; NAT traversal is on the roadmap.
+The ID is your IPv4 address as one number, picked automatically: your VPN if you have one (Radmin, Hamachi, Tailscale, Netbird, WireGuard…), otherwise your local network. It works for whoever is on that same VPN or network. Over the open internet, forward the UDP port (default 7000) to the host on your router; NAT traversal is on the roadmap.
 
-> The code contains the secret key. Anyone who has it can see and control the host. **Create new code** invalidates the old one.
+**Security:** there is no password. Nobody gets in without the host owner's click, and everything is encrypted (Noise XX, ChaCha20-Poly1305) with each computer's own key. Each side shows a 4-digit verification code; the first time you reach an ID the app remembers that computer's key and refuses a different one later. Trusted computers can be removed in Settings. The app is in Portuguese or English (Settings).
 
 ## Command line
 
 ```bash
-lindesk host --listen 0.0.0.0:7000        # headless sharing; key from LINDESK_KEY or the saved config
-lindesk view LD-XXXXXX-...                # open a remote screen from a code
+lindesk host --listen 0.0.0.0:7000        # headless sharing; answer y / a / n to connection requests
+lindesk view 0441330607                   # open a remote screen from an ID (add :port if it is not 7000)
 ```
 
 ## Build

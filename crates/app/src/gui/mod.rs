@@ -3,22 +3,22 @@
 mod theme;
 mod view;
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use iced::{Subscription, Task};
-use lindesk_proto::events::{HostEvent, ViewerEvent};
-use lindesk_proto::{code, generate_key};
+use lindesk_proto::events::{HostCommand, HostEvent, ViewerEvent};
+use lindesk_proto::id;
 
-use crate::config::{Config, Quality};
-use crate::netinfo::{self, Route};
+use crate::config::{Config, Lang, Trusted};
+use crate::i18n::Tx;
+use crate::netinfo::{self, Kind, Route};
 use crate::procs::{self, Bus, Handle};
 use crate::update::{self, Release};
 use crate::deps;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
@@ -31,14 +31,21 @@ pub enum HostState {
     Stopped,
     Starting,
     Waiting { encoder: String },
-    Connected { addr: String, fps: u32, kbps: u32 },
+    Connected { name: String, fps: u32, kbps: u32 },
 }
 
 pub enum ViewerState {
     Idle,
-    Connecting(Instant),
+    Connecting,
+    Waiting { verification: String },
     Connected { fps: u32, rtt_ms: f32 },
-    Reconnecting,
+}
+
+/// Someone unknown asking to connect to this computer.
+#[derive(Clone)]
+pub struct Request {
+    pub name: String,
+    pub verification: String,
 }
 
 pub enum UpdateState {
@@ -51,7 +58,7 @@ pub enum UpdateState {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum Kind {
+pub enum Kind2 {
     Info,
     Error,
 }
@@ -63,14 +70,16 @@ pub struct App {
     rx: Receiver<Bus>,
     tx: Sender<Bus>,
     routes: Vec<Route>,
-    route: Option<Route>,
+    show_routes: bool,
     public_busy: bool,
     host: HostState,
     host_child: Option<Handle>,
+    request: Option<Request>,
     viewer: ViewerState,
     viewer_child: Option<Handle>,
-    code_input: String,
-    notice: Option<(Kind, String)>,
+    viewer_id: Option<String>,
+    id_input: String,
+    notice: Option<(Kind2, String)>,
     update: UpdateState,
     copied_at: Option<Instant>,
     port_text: String,
@@ -82,16 +91,19 @@ pub enum Msg {
     Nav(Page),
     StartHost,
     StopHost,
-    CopyCode,
-    NewKey,
+    CopyId,
     PickRoute(Route),
+    ToggleRoutes,
     DetectPublic,
-    CodeInput(String),
+    Accept(bool),
+    Reject,
+    IdInput(String),
     Connect,
     ConnectRecent(usize),
     RemoveRecent(usize),
     Disconnect,
-    SetQuality(Quality),
+    SetLang(Lang),
+    SetQuality(view::QOpt),
     SetEncoder(view::Opt),
     SetDecoder(view::Opt),
     PortInput(String),
@@ -102,6 +114,7 @@ pub enum Msg {
     CheckUpdate,
     InstallUpdate,
     ForgetScreen,
+    RemoveTrusted(usize),
     DismissNotice,
 }
 
@@ -119,7 +132,7 @@ pub fn run() -> anyhow::Result<()> {
         .subscription(App::subscription)
         .theme(|_: &App| theme::app_theme())
         .window(iced::window::Settings {
-            size: iced::Size::new(1000.0, 660.0),
+            size: iced::Size::new(1000.0, 680.0),
             min_size: Some(iced::Size::new(820.0, 560.0)),
             icon: iced::window::icon::from_file_data(include_bytes!("../../assets/icon.png"), None).ok(),
             platform_specific: iced::window::settings::PlatformSpecific { application_id: "lindesk".into(), ..Default::default() },
@@ -133,9 +146,8 @@ impl App {
     fn new() -> (Self, Task<Msg>) {
         update::installed_exe(); // remember where we live before any update swaps the file
         let cfg = Config::load();
+        cfg.save();
         let (tx, rx) = channel();
-        let routes = netinfo::local_routes();
-        let route = routes.first().cloned();
         let disabled = std::env::var_os("LINDESK_NO_UPDATE").is_some();
         let update = if disabled { UpdateState::Disabled } else { UpdateState::Checking };
         if !disabled {
@@ -144,19 +156,25 @@ impl App {
         let port_text = cfg.port.to_string();
         (
             Self {
-                page: Page::Share,
+                page: match std::env::var("LINDESK_START_PAGE").as_deref() {
+                    Ok("connect") => Page::Connect,
+                    Ok("settings") => Page::Settings,
+                    _ => Page::Share,
+                },
                 missing: deps::check().missing,
                 cfg,
                 rx,
                 tx,
-                routes,
-                route,
+                routes: netinfo::local_routes(),
+                show_routes: false,
                 public_busy: false,
                 host: HostState::Stopped,
                 host_child: None,
+                request: None,
                 viewer: ViewerState::Idle,
                 viewer_child: None,
-                code_input: String::new(),
+                viewer_id: None,
+                id_input: String::new(),
                 notice: None,
                 update,
                 copied_at: None,
@@ -170,17 +188,25 @@ impl App {
         iced::time::every(Duration::from_millis(250)).map(|_| Msg::Tick)
     }
 
+    fn tx(&self) -> Tx {
+        Tx(self.cfg.lang)
+    }
+
     fn busy(&self) -> bool {
         !matches!(self.host, HostState::Stopped) || !matches!(self.viewer, ViewerState::Idle)
     }
 
-    fn share_code(&self) -> Option<String> {
-        let route = self.route.as_ref()?;
-        Some(code::encode(SocketAddr::new(route.ip.into(), self.cfg.port), &self.cfg.key()))
+    /// The route the ID is built from.
+    fn route(&self) -> Option<&Route> {
+        netinfo::pick(&self.routes, self.cfg.route_pref.as_deref())
+    }
+
+    fn my_id(&self) -> Option<String> {
+        self.route().map(|r| id::encode(r.ip))
     }
 
     fn fail(&mut self, msg: impl Into<String>) {
-        self.notice = Some((Kind::Error, msg.into()));
+        self.notice = Some((Kind2::Error, msg.into()));
     }
 
     fn update(&mut self, msg: Msg) -> Task<Msg> {
@@ -191,8 +217,9 @@ impl App {
                 self.notice = None;
             }
             Msg::StartHost => {
-                if self.route.is_none() {
-                    self.fail("No network address found. Connect to a network first.");
+                if self.route().is_none() {
+                    let m = self.tx().no_network();
+                    self.fail(m);
                 } else {
                     match procs::spawn_host(&self.cfg, self.cfg.port, self.tx.clone()) {
                         Ok(h) => {
@@ -200,7 +227,10 @@ impl App {
                             self.host = HostState::Starting;
                             self.notice = None;
                         }
-                        Err(e) => self.fail(format!("Could not start sharing: {e:#}")),
+                        Err(e) => {
+                            let m = self.tx().start_failed(&format!("{e:#}"));
+                            self.fail(m);
+                        }
                     }
                 }
             }
@@ -209,23 +239,19 @@ impl App {
                     h.stop();
                 }
                 self.host = HostState::Stopped;
+                self.request = None;
             }
-            Msg::CopyCode => {
-                if let Some(c) = self.share_code() {
+            Msg::CopyId => {
+                if let Some(i) = self.my_id() {
                     self.copied_at = Some(Instant::now());
-                    return iced::clipboard::write(c);
+                    return iced::clipboard::write(id::pretty(&i));
                 }
             }
-            Msg::NewKey => {
-                if matches!(self.host, HostState::Stopped) {
-                    self.cfg.host_key = generate_key();
-                    self.cfg.save();
-                    self.notice = Some((Kind::Info, "New code created. The old one no longer works.".into()));
-                } else {
-                    self.fail("Stop sharing first, then create a new code.");
-                }
+            Msg::PickRoute(r) => {
+                self.cfg.route_pref = Some(r.iface);
+                self.cfg.save();
             }
-            Msg::PickRoute(r) => self.route = Some(r),
+            Msg::ToggleRoutes => self.show_routes = !self.show_routes,
             Msg::DetectPublic => {
                 self.public_busy = true;
                 let tx = self.tx.clone();
@@ -233,14 +259,31 @@ impl App {
                     let _ = tx.send(Bus::PublicIp(netinfo::public_ip()));
                 });
             }
-            Msg::CodeInput(s) => self.code_input = s,
+            Msg::Accept(trust) => {
+                if self.request.take().is_some() {
+                    if let Some(h) = self.host_child.as_mut() {
+                        h.command(&HostCommand::Accept { trust });
+                    }
+                }
+            }
+            Msg::Reject => {
+                if self.request.take().is_some() {
+                    if let Some(h) = self.host_child.as_mut() {
+                        h.command(&HostCommand::Reject);
+                    }
+                }
+            }
+            Msg::IdInput(s) => {
+                let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == ':').collect();
+                self.id_input = if cleaned.len() == 10 && !cleaned.contains(':') { id::pretty(&cleaned) } else { cleaned };
+            }
             Msg::Connect => {
-                let c = self.code_input.trim().to_string();
-                self.connect(&c);
+                let t = self.id_input.clone();
+                self.connect(&t);
             }
             Msg::ConnectRecent(i) => {
                 if let Some(r) = self.cfg.recent.get(i).cloned() {
-                    self.connect(&r.code);
+                    self.connect(&r.id);
                 }
             }
             Msg::RemoveRecent(i) => {
@@ -255,8 +298,12 @@ impl App {
                 }
                 self.viewer = ViewerState::Idle;
             }
-            Msg::SetQuality(q) => {
-                self.cfg.quality = q;
+            Msg::SetLang(l) => {
+                self.cfg.lang = l;
+                self.cfg.save();
+            }
+            Msg::SetQuality(o) => {
+                self.cfg.quality = o.0;
                 self.cfg.save();
             }
             Msg::SetEncoder(o) => {
@@ -299,35 +346,53 @@ impl App {
             Msg::InstallUpdate => self.install_update(),
             Msg::ForgetScreen => {
                 lindesk_host::portal::forget_choice();
-                self.notice = Some((Kind::Info, "Done. Next time you share, the system asks which screen to use.".into()));
+                self.notice = Some((Kind2::Info, self.tx().forgot_done().into()));
+            }
+            Msg::RemoveTrusted(i) => {
+                if i < self.cfg.trusted.len() {
+                    let t = self.cfg.trusted.remove(i);
+                    self.cfg.save();
+                    if let Some(h) = self.host_child.as_mut() {
+                        h.command(&HostCommand::Untrust { key: t.key });
+                    }
+                }
             }
             Msg::DismissNotice => self.notice = None,
         }
         Task::none()
     }
 
-    fn connect(&mut self, code_text: &str) {
+    fn connect(&mut self, text: &str) {
         if !matches!(self.viewer, ViewerState::Idle) {
             return;
         }
-        match code::decode(code_text) {
-            Err(e) => self.fail(format!("{e}")),
-            Ok((addr, _)) => match procs::spawn_viewer(&self.cfg, code_text, self.tx.clone()) {
-                Ok(h) => {
-                    self.viewer_child = Some(h);
-                    self.viewer = ViewerState::Connecting(Instant::now());
-                    self.cfg.remember(code_text, addr.ip().to_string());
-                    self.notice = None;
-                }
-                Err(e) => self.fail(format!("Could not open the viewer: {e:#}")),
-            },
+        let Ok(addr) = id::parse(text) else {
+            let m = self.tx().bad_id();
+            self.fail(m);
+            return;
+        };
+        let Some(id_text) = id::of(addr) else { return };
+        let target = if addr.port() == id::DEFAULT_PORT { id_text.clone() } else { format!("{id_text}:{}", addr.port()) };
+        let pin = self.cfg.pinned_for(&id_text).map(|k| lindesk_proto::session::key_hex(&k));
+        match procs::spawn_viewer(&self.cfg, &target, pin, self.tx.clone()) {
+            Ok(h) => {
+                self.viewer_child = Some(h);
+                self.viewer = ViewerState::Connecting;
+                self.viewer_id = Some(id_text);
+                self.notice = None;
+            }
+            Err(e) => {
+                let m = self.tx().viewer_failed(&format!("{e:#}"));
+                self.fail(m);
+            }
         }
     }
 
     fn install_update(&mut self) {
         let UpdateState::Available(rel) = &self.update else { return };
         if self.busy() {
-            self.fail("Stop sharing and disconnect before updating.");
+            let m = self.tx().upd_busy();
+            self.fail(m);
             return;
         }
         let rel = rel.clone();
@@ -353,37 +418,73 @@ impl App {
             match m {
                 Bus::Host(ev) => match ev {
                     HostEvent::Listening { encoder, .. } => self.host = HostState::Waiting { encoder },
-                    HostEvent::ClientConnected { addr } => self.host = HostState::Connected { addr, fps: 0, kbps: 0 },
+                    HostEvent::ConnectRequest { name, verification, .. } => {
+                        self.request = Some(Request { name, verification });
+                    }
+                    HostEvent::ClientConnected { name, .. } => {
+                        self.request = None;
+                        self.host = HostState::Connected { name, fps: 0, kbps: 0 };
+                    }
                     HostEvent::ClientLeft { .. } => {
-                        let enc = self.encoder_name();
-                        self.host = HostState::Waiting { encoder: enc };
+                        self.request = None;
+                        if !matches!(self.host, HostState::Stopped) {
+                            self.host = HostState::Waiting { encoder: "auto".into() };
+                        }
+                    }
+                    HostEvent::Trusted { key, name } => {
+                        if !self.cfg.trusted.iter().any(|t| t.key == key) {
+                            self.cfg.trusted.push(Trusted { key, name });
+                            self.cfg.save();
+                        }
                     }
                     HostEvent::Stats { fps, kbps, .. } => {
                         if let HostState::Connected { fps: f, kbps: k, .. } = &mut self.host {
                             (*f, *k) = (fps, kbps);
                         }
                     }
-                    HostEvent::Error { message } => self.fail(message),
+                    HostEvent::Error { message } => {
+                        let m = self.tx().localize(&message);
+                        self.fail(m);
+                    }
                 },
                 Bus::HostExit(how) => {
                     self.host_child = None;
+                    self.request = None;
                     if !matches!(self.host, HostState::Stopped) && !how.is_empty() {
-                        self.fail(format!("Sharing stopped unexpectedly ({how}). Details: ~/.config/lindesk/logs/host.log"));
+                        let m = self.tx().host_crashed(&how);
+                        self.fail(m);
                     }
                     self.host = HostState::Stopped;
                 }
                 Bus::Viewer(ev) => match ev {
-                    ViewerEvent::Connecting => {}
-                    ViewerEvent::Connected => self.viewer = ViewerState::Connected { fps: 0, rtt_ms: 0.0 },
+                    ViewerEvent::Connecting | ViewerEvent::Closed | ViewerEvent::Denied => {}
+                    ViewerEvent::Waiting { verification } => self.viewer = ViewerState::Waiting { verification },
+                    ViewerEvent::HostIdentity { key, .. } => {
+                        // First visit: remember who this ID really is, so an impostor is caught next time.
+                        if let Some(id_text) = self.viewer_id.clone() {
+                            if self.cfg.pinned_for(&id_text).is_none() {
+                                self.cfg.pin(&id_text, &key);
+                            }
+                        }
+                    }
+                    ViewerEvent::Connected => {
+                        self.viewer = ViewerState::Connected { fps: 0, rtt_ms: 0.0 };
+                        if let Some(id_text) = self.viewer_id.clone() {
+                            self.cfg.remember(&id_text, id::pretty(&id_text));
+                        }
+                    }
                     ViewerEvent::Stats { fps, rtt_ms, .. } => self.viewer = ViewerState::Connected { fps, rtt_ms },
-                    ViewerEvent::Reconnecting => self.viewer = ViewerState::Reconnecting,
-                    ViewerEvent::Closed => {}
-                    ViewerEvent::Error { message } => self.fail(message),
+                    ViewerEvent::Reconnecting => {}
+                    ViewerEvent::Error { message } => {
+                        let m = self.tx().localize(&message);
+                        self.fail(m);
+                    }
                 },
                 Bus::ViewerExit(how) => {
                     self.viewer_child = None;
-                    if matches!(self.viewer, ViewerState::Connecting(_)) && self.notice.is_none() {
-                        self.fail(if how.is_empty() { "The viewer closed before connecting.".to_string() } else { format!("The viewer failed ({how}). Details: ~/.config/lindesk/logs/view.log") });
+                    if !matches!(self.viewer, ViewerState::Connected { .. }) && self.notice.is_none() {
+                        let m = if how.is_empty() { self.tx().viewer_closed().to_string() } else { self.tx().viewer_failed(&how) };
+                        self.fail(m);
                     }
                     self.viewer = ViewerState::Idle;
                 }
@@ -391,7 +492,10 @@ impl App {
                     self.public_busy = false;
                     match ip {
                         Some(ip) => self.add_public(ip),
-                        None => self.fail("Could not detect the public address. Check your internet connection."),
+                        None => {
+                            let m = self.tx().public_failed();
+                            self.fail(m);
+                        }
                     }
                 }
                 Bus::UpdateFound(r) => match r {
@@ -419,35 +523,17 @@ impl App {
                 }
             }
         }
-        if let ViewerState::Connecting(t) = self.viewer {
-            if t.elapsed() > CONNECT_TIMEOUT {
-                if let Some(h) = self.viewer_child.take() {
-                    h.stop();
-                }
-                self.viewer = ViewerState::Idle;
-                self.fail(format!(
-                    "No answer from the other computer. Check that it is sharing, that the code is current, and that UDP port {} is reachable (firewall / router).",
-                    code::decode(&self.cfg.recent.first().map(|r| r.code.clone()).unwrap_or_default()).map(|(a, _)| a.port()).unwrap_or(self.cfg.port)
-                ));
-            }
-        }
         if self.copied_at.is_some_and(|t| t.elapsed() > Duration::from_secs(2)) {
             self.copied_at = None;
         }
     }
 
-    fn encoder_name(&self) -> String {
-        match &self.host {
-            HostState::Waiting { encoder } => encoder.clone(),
-            _ => "auto".into(),
-        }
-    }
-
     fn add_public(&mut self, ip: Ipv4Addr) {
-        let r = Route { label: "Internet (needs port forwarding)".into(), ip };
-        self.routes.retain(|x| !x.label.starts_with("Internet"));
-        self.routes.push(r.clone());
-        self.route = Some(r);
+        let r = Route { kind: Kind::Internet, iface: "internet".into(), ip };
+        self.routes.retain(|x| x.kind != Kind::Internet);
+        self.routes.push(r);
+        self.cfg.route_pref = Some("internet".into());
+        self.cfg.save();
     }
 }
 

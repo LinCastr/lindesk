@@ -1,19 +1,20 @@
 mod config;
 mod deps;
 mod gui;
+mod i18n;
 mod netinfo;
 mod procs;
 mod update;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lindesk_proto::events::{HostEvent, ViewerEvent, to_line};
-use lindesk_proto::{code, parse_key};
+use lindesk_proto::events::{HostCommand, HostEvent, ViewerEvent, to_line};
+use lindesk_proto::session::from_hex32;
+use lindesk_proto::id;
 
 #[derive(Parser)]
 #[command(name = "lindesk", version, about = "Low-latency remote desktop with a Wayland host")]
@@ -34,9 +35,6 @@ enum Cmd {
 struct HostArgs {
     #[arg(long)]
     listen: Option<SocketAddr>,
-    /// Hex key. Prefer the LINDESK_KEY environment variable: arguments show up in `ps`.
-    #[arg(long, env = "LINDESK_KEY", hide_env_values = true)]
-    key: Option<String>,
     /// portal | test | node:<pipewire-node-id>
     #[arg(long, default_value = "portal")]
     source: String,
@@ -50,7 +48,10 @@ struct HostArgs {
     no_cursor: bool,
     #[arg(long)]
     no_input: bool,
-    /// Print status events as JSON lines and stop when stdin closes.
+    /// Accept every connection without asking (tests only).
+    #[arg(long)]
+    accept_all: bool,
+    /// Print status events as JSON lines, read commands as JSON lines, stop when stdin closes.
     #[arg(long)]
     json: bool,
     /// Forget the remembered screen/window choice and exit.
@@ -60,13 +61,14 @@ struct HostArgs {
 
 #[derive(Parser)]
 struct ViewArgs {
-    /// Connection code (LD-...) or host:port together with --key.
-    #[arg(env = "LINDESK_CODE", hide_env_values = true)]
+    /// The other computer's 10-digit ID (optionally `:port`).
     target: String,
-    #[arg(long, env = "LINDESK_KEY", hide_env_values = true)]
-    key: Option<String>,
+    /// Hex public key the host must present (remembered from an earlier visit).
     #[arg(long)]
-    key_file: Option<PathBuf>,
+    pin: Option<String>,
+    /// Name shown in the host's accept dialog.
+    #[arg(long)]
+    name: Option<String>,
     #[arg(long, default_value = "auto")]
     decoder: String,
     #[arg(long)]
@@ -95,32 +97,53 @@ fn run_host(a: HostArgs) -> Result<()> {
         return Ok(());
     }
     let cfg = config::Config::load();
-    let key = match a.key {
-        Some(k) => parse_key(&k)?,
-        None => cfg.key(),
-    };
     let stop = Arc::new(AtomicBool::new(false));
-    if a.json {
-        // The window owns this process: when it closes our stdin (or dies), stop.
-        let s = stop.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<HostCommand>();
+    {
+        // The window owns this process through stdin: commands in, EOF means stop.
+        // Without a window, a person at a terminal answers y / a / n.
+        let (s, json) = (stop.clone(), a.json);
         std::thread::spawn(move || {
-            let mut sink = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+            for line in std::io::stdin().lines().map_while(|l| l.ok()) {
+                let cmd = if json {
+                    lindesk_proto::events::from_line::<HostCommand>(&line)
+                } else {
+                    match line.trim() {
+                        "y" => Some(HostCommand::Accept { trust: false }),
+                        "a" => Some(HostCommand::Accept { trust: true }),
+                        "n" => Some(HostCommand::Reject),
+                        _ => None,
+                    }
+                };
+                if let Some(c) = cmd {
+                    let _ = tx.send(c);
+                }
+            }
             s.store(true, Ordering::Relaxed);
         });
     }
     let json = a.json;
+    let standalone = !a.json;
     let emit = move |ev: HostEvent| {
         if json {
             println!("{}", to_line(&ev));
-        } else {
-            eprintln!("{ev:?}");
+            return;
+        }
+        match &ev {
+            HostEvent::ConnectRequest { name, addr, verification, .. } => {
+                eprintln!("{name} ({addr}) wants to connect, verification code {verification}. Accept? [y] once  [a] always  [n] no");
+            }
+            HostEvent::Trusted { key, name } if standalone => persist_trusted(key, name),
+            other => eprintln!("{other:?}"),
         }
     };
+    let trusted = cfg.trusted.iter().filter_map(|t| from_hex32(&t.key).ok()).collect();
     let result = lindesk_host::run(
         lindesk_host::Options {
             listen: a.listen.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], cfg.port))),
-            key,
+            identity: config::identity(),
+            trusted,
+            accept_all: a.accept_all,
             source: a.source,
             encoder: parse_encoder(&a.encoder)?,
             fps: a.fps,
@@ -129,12 +152,22 @@ fn run_host(a: HostArgs) -> Result<()> {
             input: !a.no_input,
         },
         stop,
+        rx,
         &emit,
     );
     if let Err(e) = &result {
         emit(HostEvent::Error { message: format!("{e:#}") });
     }
     result
+}
+
+/// Terminal mode has no window to remember trusted computers for us.
+fn persist_trusted(key: &str, name: &str) {
+    let mut cfg = config::Config::load();
+    if !cfg.trusted.iter().any(|t| t.key == key) {
+        cfg.trusted.push(config::Trusted { key: key.to_string(), name: name.to_string() });
+        cfg.save();
+    }
 }
 
 fn parse_encoder(s: &str) -> Result<lindesk_host::Encoder> {
@@ -160,32 +193,39 @@ fn parse_decoder(s: &str) -> Result<lindesk_viewer::Decoder> {
 }
 
 fn run_view(a: ViewArgs) -> Result<()> {
-    let (host, key) = if a.target.trim_start().get(..2).is_some_and(|p| p.eq_ignore_ascii_case("LD")) {
-        code::decode(&a.target)?
-    } else {
-        let key_text = match (&a.key, &a.key_file) {
-            (Some(k), _) => k.clone(),
-            (None, Some(f)) => std::fs::read_to_string(f).with_context(|| format!("read {}", f.display()))?,
-            (None, None) => anyhow::bail!("give a connection code, or host:port with --key/--key-file"),
-        };
-        let addr = std::net::ToSocketAddrs::to_socket_addrs(&a.target.as_str())
-            .context("resolve host")?
-            .next()
-            .context("host resolved to nothing")?;
-        (addr, parse_key(&key_text)?)
+    let host = id::parse(&a.target)?;
+    let id_text = id::of(host).context("IPv6 hosts have no ID")?;
+    let cfg = config::Config::load();
+    let pinned = match &a.pin {
+        Some(k) => Some(from_hex32(k).context("--pin must be 64 hex characters")?),
+        None if !a.json => cfg.pinned_for(&id_text),
+        None => None,
     };
     let json = a.json;
+    let standalone = !a.json;
     let emit = move |ev: ViewerEvent| {
         if json {
             println!("{}", to_line(&ev));
-        } else if let ViewerEvent::Stats { fps, lost, rtt_ms } = ev {
-            eprintln!("fps={fps} lost={lost} rtt={rtt_ms:.1}ms");
+            return;
+        }
+        match ev {
+            ViewerEvent::Stats { fps, lost, rtt_ms } => eprintln!("fps={fps} lost={lost} rtt={rtt_ms:.1}ms"),
+            ViewerEvent::HostIdentity { key, fingerprint } if standalone => {
+                let mut cfg = config::Config::load();
+                if cfg.pinned_for(&id_text).is_none() {
+                    cfg.pin(&id_text, &key);
+                    eprintln!("Remembered this computer's identity ({fingerprint}).");
+                }
+            }
+            other => eprintln!("{other:?}"),
         }
     };
     let result = lindesk_viewer::run(
         lindesk_viewer::Options {
             host,
-            key,
+            identity: config::identity(),
+            name: a.name.unwrap_or_else(config::computer_name),
+            pinned,
             decoder: parse_decoder(&a.decoder)?,
             fullscreen: a.fullscreen,
             headless_seconds: a.headless_seconds,

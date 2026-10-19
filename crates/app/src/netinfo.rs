@@ -3,41 +3,70 @@
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Vpn,
+    Lan,
+    Virtual,
+    Internet,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Route {
-    pub label: String,
+    pub kind: Kind,
+    /// Interface name (`radminvpn0`, `enp3s0`) or "internet".
+    pub iface: String,
     pub ip: Ipv4Addr,
 }
 
 impl std::fmt::Display for Route {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} · {}", self.label, self.ip)
+        write!(f, "{} · {}", self.iface, self.ip)
     }
 }
 
-/// Non-loopback IPv4 addresses of this computer (LAN, VPN, ...), best guess first.
+fn classify(name: &str, ip: Ipv4Addr) -> Kind {
+    const VPN_PREFIX: [&str; 12] = ["tun", "tap", "wg", "tailscale", "zt", "radmin", "ham", "wt", "nordlynx", "proton", "mullvad", "ppp"];
+    const VIRTUAL_PREFIX: [&str; 5] = ["docker", "br-", "veth", "virbr", "vmnet"];
+    let o = ip.octets();
+    let vpn_range = o[0] == 26 || o[0] == 25 || (o[0] == 100 && (64..128).contains(&o[1])); // Radmin, Hamachi, CGNAT/Tailscale/Netbird
+    if VIRTUAL_PREFIX.iter().any(|p| name.starts_with(p)) {
+        Kind::Virtual
+    } else if vpn_range || VPN_PREFIX.iter().any(|p| name.starts_with(p)) {
+        Kind::Vpn
+    } else {
+        Kind::Lan
+    }
+}
+
+/// Non-loopback IPv4 addresses of this computer, VPN first (that is what people
+/// usually connect through), then local network, then virtual adapters.
 pub fn local_routes() -> Vec<Route> {
     let mut v: Vec<Route> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
         .filter(|i| !i.is_loopback())
         .filter_map(|i| match i.ip() {
-            std::net::IpAddr::V4(ip) if !ip.is_link_local() => {
-                let name = i.name;
-                let label = if name.starts_with("tun") || name.starts_with("tap") || name.starts_with("wg") || name.starts_with("rad") || name.starts_with("tailscale") {
-                    format!("VPN ({name})")
-                } else if name.starts_with("docker") || name.starts_with("br-") || name.starts_with("veth") || name.starts_with("virbr") {
-                    format!("Virtual ({name})")
-                } else {
-                    format!("Local network ({name})")
-                };
-                Some(Route { label, ip })
-            }
+            std::net::IpAddr::V4(ip) if !ip.is_link_local() => Some(Route { kind: classify(&i.name, ip), iface: i.name, ip }),
             _ => None,
         })
         .collect();
-    v.sort_by_key(|r| r.label.starts_with("Virtual"));
+    // Radmin (26/8) and Hamachi (25/8) are what game friends use, so they win over other VPNs.
+    v.sort_by_key(|r| match (r.kind, r.ip.octets()[0]) {
+        (Kind::Vpn, 26) => 0,
+        (Kind::Vpn, 25) => 1,
+        (Kind::Vpn, _) => 2,
+        (Kind::Lan, _) => 3,
+        (Kind::Internet, _) => 4,
+        (Kind::Virtual, _) => 5,
+    });
     v
+}
+
+/// The route to build the ID from: the user's preference if it still exists,
+/// otherwise the best one that is not a virtual adapter.
+pub fn pick<'a>(routes: &'a [Route], pref: Option<&str>) -> Option<&'a Route> {
+    pref.and_then(|p| routes.iter().find(|r| r.iface == p)).or_else(|| routes.iter().find(|r| r.kind != Kind::Virtual))
 }
 
 /// Public IPv4 as seen by a STUN server (RFC 5389 binding request).
@@ -83,6 +112,36 @@ fn parse_binding_response(b: &[u8], txid: &[u8]) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_vpn_lan_virtual() {
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        assert_eq!(classify("radminvpn0", ip("26.78.43.175")), Kind::Vpn);
+        assert_eq!(classify("eth9", ip("26.1.1.1")), Kind::Vpn);
+        assert_eq!(classify("wt0", ip("100.77.182.163")), Kind::Vpn);
+        assert_eq!(classify("enp3s0", ip("192.168.0.124")), Kind::Lan);
+        assert_eq!(classify("docker0", ip("172.17.0.1")), Kind::Virtual);
+    }
+
+    #[test]
+    fn pick_prefers_choice_then_best() {
+        let r = |k, i: &str, ip: &str| Route { kind: k, iface: i.into(), ip: ip.parse().unwrap() };
+        let routes = vec![r(Kind::Vpn, "radminvpn0", "26.1.1.1"), r(Kind::Lan, "enp3s0", "192.168.0.2"), r(Kind::Virtual, "docker0", "172.17.0.1")];
+        assert_eq!(pick(&routes, None).unwrap().iface, "radminvpn0");
+        assert_eq!(pick(&routes, Some("enp3s0")).unwrap().iface, "enp3s0");
+        assert_eq!(pick(&routes, Some("gone0")).unwrap().iface, "radminvpn0");
+        assert_eq!(pick(&routes[2..], None), None);
+    }
+
+    #[test]
+    fn radmin_beats_other_vpns() {
+        let mut v = vec![
+            Route { kind: Kind::Vpn, iface: "wt0".into(), ip: "100.77.1.1".parse().unwrap() },
+            Route { kind: Kind::Vpn, iface: "radminvpn0".into(), ip: "26.1.1.1".parse().unwrap() },
+        ];
+        v.sort_by_key(|r| if r.ip.octets()[0] == 26 { 0 } else { 2 });
+        assert_eq!(v[0].iface, "radminvpn0");
+    }
 
     #[test]
     fn parses_xor_mapped_address() {

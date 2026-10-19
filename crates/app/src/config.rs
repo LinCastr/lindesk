@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use lindesk_proto::{generate_key, parse_key};
+use lindesk_proto::Identity;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,28 +25,63 @@ impl Quality {
     }
 }
 
-impl std::fmt::Display for Quality {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Lang {
+    Pt,
+    En,
+}
+
+impl Lang {
+    pub const ALL: [Lang; 2] = [Lang::Pt, Lang::En];
+
+    /// Portuguese for pt_* locales, English otherwise.
+    pub fn detect() -> Self {
+        let loc = ["LC_ALL", "LC_MESSAGES", "LANG"].iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty())).unwrap_or_default();
+        if loc.to_lowercase().starts_with("pt") { Lang::Pt } else { Lang::En }
+    }
+}
+
+impl std::fmt::Display for Lang {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Quality::Balanced => "Balanced · 60 fps, up to 20 Mbps",
-            Quality::HighQuality => "High quality · 60 fps, up to 40 Mbps",
-            Quality::LowBandwidth => "Low bandwidth · 30 fps, up to 6 Mbps",
+            Lang::Pt => "Português (Brasil)",
+            Lang::En => "English",
         })
     }
 }
 
+/// A computer we connected to before.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Recent {
     pub name: String,
-    pub code: String,
+    /// 10-digit ID (digits only).
+    pub id: String,
+}
+
+/// A computer allowed to connect without asking.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Trusted {
+    /// Hex public key.
+    pub key: String,
+    pub name: String,
+}
+
+/// First-use pinned identity of a host we connected to.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnownHost {
+    pub id: String,
+    pub key: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Secret shared with computers allowed to connect (hex).
-    pub host_key: String,
+    pub lang: Lang,
     pub port: u16,
+    /// Network interface the ID is built from (None = best available).
+    pub route_pref: Option<String>,
+    pub trusted: Vec<Trusted>,
+    pub known_hosts: Vec<KnownHost>,
     pub quality: Quality,
     pub encoder: String,
     pub decoder: String,
@@ -60,8 +95,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            host_key: generate_key(),
+            lang: Lang::detect(),
             port: 7000,
+            route_pref: None,
+            trusted: Vec::new(),
+            known_hosts: Vec::new(),
             quality: Quality::Balanced,
             encoder: "auto".into(),
             decoder: "auto".into(),
@@ -75,6 +113,9 @@ impl Default for Config {
 }
 
 pub fn dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("LINDESK_CONFIG_DIR") {
+        return PathBuf::from(d);
+    }
     directories::ProjectDirs::from("", "", "lindesk")
         .map(|d| d.config_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))
@@ -85,16 +126,10 @@ fn path() -> PathBuf {
 }
 
 impl Config {
+    /// Reads the file without writing it: only the window saves, so the host and
+    /// viewer processes can never overwrite what the window changed.
     pub fn load() -> Self {
-        let mut c: Config = std::fs::read_to_string(path())
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
-        if parse_key(&c.host_key).is_err() {
-            c.host_key = generate_key();
-        }
-        c.save();
-        c
+        std::fs::read_to_string(path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
     }
 
     pub fn save(&self) {
@@ -113,14 +148,45 @@ impl Config {
         }
     }
 
-    pub fn key(&self) -> [u8; 32] {
-        parse_key(&self.host_key).expect("validated on load")
-    }
-
-    pub fn remember(&mut self, code: &str, name: String) {
-        self.recent.retain(|r| r.code != code);
-        self.recent.insert(0, Recent { name, code: code.to_string() });
+    pub fn remember(&mut self, id: &str, name: String) {
+        self.recent.retain(|r| r.id != id);
+        self.recent.insert(0, Recent { name, id: id.to_string() });
         self.recent.truncate(8);
         self.save();
     }
+
+    pub fn pinned_for(&self, id: &str) -> Option<[u8; 32]> {
+        self.known_hosts.iter().find(|k| k.id == id).and_then(|k| lindesk_proto::session::from_hex32(&k.key).ok())
+    }
+
+    pub fn pin(&mut self, id: &str, key: &str) {
+        self.known_hosts.retain(|k| k.id != id);
+        self.known_hosts.push(KnownHost { id: id.to_string(), key: key.to_string() });
+        self.save();
+    }
+}
+
+/// This computer's long-term identity, created on first use (owner-only file).
+pub fn identity() -> Identity {
+    let path = dir().join("identity.key");
+    if let Some(id) = std::fs::read_to_string(&path).ok().and_then(|t| Identity::from_hex(&t).ok()) {
+        return id;
+    }
+    let id = Identity::generate();
+    let _ = std::fs::create_dir_all(dir());
+    if std::fs::write(&path, id.to_hex()).is_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    id
+}
+
+/// Name shown to the other side's owner.
+pub fn computer_name() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "Linux".to_string())
 }

@@ -1,134 +1,30 @@
 //! Wire protocol shared by host and client.
 //!
-//! Every datagram is `counter(8, LE) || AEAD(plaintext)`. The AEAD is
-//! ChaCha20-Poly1305 keyed with a 32-byte pre-shared key; the nonce is a
-//! direction byte plus the counter, so both sides can send without
-//! coordinating. A sliding window on the receiver rejects replays.
+//! A connection starts with a Noise XX handshake (see [`session`]) that gives
+//! both sides each other's long-term public key and fresh session keys; after
+//! that every datagram is `counter(8, LE) || ChaCha20-Poly1305(plaintext)`.
+//! A sliding window on the receiver rejects replays.
 //!
 //! Plaintext is `type(1) || body`. Video travels as fragments of one H.264
 //! access unit each; losing any fragment drops the whole frame (see
 //! [`Reassembler`]) because retransmitting is slower than the next frame.
 
-pub mod code;
 pub mod events;
+pub mod id;
+pub mod session;
+
+pub use session::{Identity, Initiator, Responder, Session};
 
 use std::collections::HashMap;
 
 use anyhow::{Result, bail, ensure};
 use reed_solomon_erasure::galois_8::ReedSolomon;
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 /// Payload bytes of one video fragment. Keeps the datagram under a 1280 MTU.
 pub const FRAG_PAYLOAD: usize = 1100;
 pub const MAX_DATAGRAM: usize = 1500;
-const TAG: usize = 16;
-
-/// Which side produced a datagram; part of the AEAD nonce.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Client = 0,
-    Host = 1,
-}
-
-pub fn parse_key(s: &str) -> Result<[u8; 32]> {
-    let s = s.trim();
-    ensure!(s.len() == 64, "key must be 64 hex characters");
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
-    }
-    Ok(out)
-}
-
-pub fn generate_key() -> String {
-    use rand::RngCore;
-    let mut k = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut k);
-    k.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Encrypts outgoing and authenticates incoming datagrams.
-pub struct Channel {
-    aead: ChaCha20Poly1305,
-    me: Side,
-    next: u64,
-    // replay window: highest counter seen + bitmap of the 128 before it
-    top: u64,
-    seen: u128,
-    any: bool,
-}
-
-impl Channel {
-    pub fn new(key: &[u8; 32], me: Side) -> Self {
-        // Microseconds since the epoch: monotonic across restarts, so a
-        // restarted peer is never rejected as a replay.
-        let start = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(1);
-        Self {
-            aead: ChaCha20Poly1305::new(Key::from_slice(key)),
-            me,
-            next: start,
-            top: 0,
-            seen: 0,
-            any: false,
-        }
-    }
-
-    fn nonce(side: Side, counter: u64) -> Nonce {
-        let mut n = [0u8; 12];
-        n[0] = side as u8;
-        n[4..].copy_from_slice(&counter.to_le_bytes());
-        *Nonce::from_slice(&n)
-    }
-
-    /// Encrypts `msg` into a ready-to-send datagram.
-    pub fn seal(&mut self, msg: &Msg) -> Vec<u8> {
-        let plain = msg.encode();
-        let counter = self.next;
-        self.next += 1;
-        let ct = self
-            .aead
-            .encrypt(&Self::nonce(self.me, counter), plain.as_slice())
-            .expect("encrypt");
-        let mut out = Vec::with_capacity(8 + ct.len());
-        out.extend_from_slice(&counter.to_le_bytes());
-        out.extend_from_slice(&ct);
-        out
-    }
-
-    /// Verifies and decodes a datagram from the peer. Rejects forgeries and replays.
-    pub fn open(&mut self, data: &[u8]) -> Result<Msg> {
-        ensure!(data.len() > 8 + TAG, "short datagram");
-        let counter = u64::from_le_bytes(data[..8].try_into().unwrap());
-        let peer = if self.me == Side::Host { Side::Client } else { Side::Host };
-        let plain = self
-            .aead
-            .decrypt(&Self::nonce(peer, counter), &data[8..])
-            .map_err(|_| anyhow::anyhow!("authentication failed"))?;
-        // Only update the window after authentication succeeded.
-        if self.any {
-            if counter > self.top {
-                let shift = counter - self.top;
-                self.seen = if shift >= 128 { 0 } else { (self.seen << shift) | (1u128 << (shift - 1)) };
-                self.top = counter;
-            } else {
-                let back = self.top - counter;
-                ensure!(back != 0 && back <= 128, "replayed or too old");
-                let bit = 1u128 << (back - 1);
-                ensure!(self.seen & bit == 0, "replayed");
-                self.seen |= bit;
-            }
-        } else {
-            self.any = true;
-            self.top = counter;
-        }
-        Msg::decode(&plain)
-    }
-}
+pub const MAX_NAME: usize = 48;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InputEvent {
@@ -164,7 +60,8 @@ pub struct Shard {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {
-    Hello { version: u16 },
+    /// First transport message: protocol version and a display name of the client computer.
+    Hello { version: u16, name: String },
     Video(Shard),
     RequestKeyframe,
     /// Receive report for the last interval; drives the host's bitrate control.
@@ -174,15 +71,18 @@ pub enum Msg {
     /// `seq` lets the host drop the duplicate copies of a reliable event.
     Input { seq: u32, ev: InputEvent },
     Bye,
+    /// Host's answer to Hello: 0 waiting for the owner, 1 accepted, 2 denied.
+    Status(u8),
 }
 
 impl Msg {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(32);
         match self {
-            Msg::Hello { version } => {
+            Msg::Hello { version, name } => {
                 b.push(1);
                 b.extend_from_slice(&version.to_le_bytes());
+                b.extend_from_slice(&name.as_bytes()[..name.len().min(MAX_NAME)]);
             }
             Msg::Video(sh) => {
                 b.push(2);
@@ -233,6 +133,10 @@ impl Msg {
                 }
             }
             Msg::Bye => b.push(8),
+            Msg::Status(v) => {
+                b.push(9);
+                b.push(*v);
+            }
         }
         b
     }
@@ -250,7 +154,10 @@ impl Msg {
         };
         let u8_at = |i: usize| -> Result<u8> { p.get(i).copied().ok_or_else(|| anyhow::anyhow!("short")) };
         Ok(match p[0] {
-            1 => Msg::Hello { version: u16_at(1)? },
+            1 => Msg::Hello {
+                version: u16_at(1)?,
+                name: String::from_utf8_lossy(p.get(3..).unwrap_or_default()).chars().filter(|c| !c.is_control()).take(MAX_NAME).collect(),
+            },
             2 => {
                 let (group, groups, idx, k, m) = (u8_at(6)?, u8_at(7)?, u8_at(8)?, u8_at(9)?, u8_at(10)?);
                 ensure!(k > 0 && groups > 0 && group < groups, "bad group");
@@ -276,6 +183,7 @@ impl Msg {
                 Msg::Input { seq, ev }
             }
             8 => Msg::Bye,
+            9 => Msg::Status(u8_at(1)?),
             t => bail!("unknown message type {t}"),
         })
     }
@@ -487,43 +395,11 @@ impl Reassembler {
 mod tests {
     use super::*;
 
-    fn pair() -> (Channel, Channel) {
-        let k = [7u8; 32];
-        (Channel::new(&k, Side::Host), Channel::new(&k, Side::Client))
-    }
-
-    #[test]
-    fn roundtrip_and_replay() {
-        let (mut h, mut c) = pair();
-        let d = h.seal(&Msg::Ping(42));
-        assert_eq!(c.open(&d).unwrap(), Msg::Ping(42));
-        assert!(c.open(&d).is_err(), "replay must fail");
-    }
-
-    #[test]
-    fn rejects_tamper_and_wrong_key() {
-        let (mut h, mut c) = pair();
-        let mut d = h.seal(&Msg::Bye);
-        let last = d.len() - 1;
-        d[last] ^= 1;
-        assert!(c.open(&d).is_err());
-        let mut other = Channel::new(&[9u8; 32], Side::Client);
-        assert!(other.open(&h.seal(&Msg::Bye)).is_err());
-    }
-
-    #[test]
-    fn out_of_order_within_window() {
-        let (mut h, mut c) = pair();
-        let a = h.seal(&Msg::Ping(1));
-        let b = h.seal(&Msg::Ping(2));
-        assert_eq!(c.open(&b).unwrap(), Msg::Ping(2));
-        assert_eq!(c.open(&a).unwrap(), Msg::Ping(1));
-    }
-
     #[test]
     fn msg_roundtrip() {
         for m in [
-            Msg::Hello { version: 1 },
+            Msg::Hello { version: 1, name: "PC de Teste".into() },
+            Msg::Status(1),
             Msg::RequestKeyframe,
             Msg::Stats { frames_ok: 5, frames_lost: 2 },
             Msg::Input { seq: 9, ev: InputEvent::MouseAbs { x: 1, y: 65535 } },

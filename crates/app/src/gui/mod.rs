@@ -118,7 +118,19 @@ pub enum Msg {
     DismissNotice,
 }
 
+/// The installer puts the menu icon in the user's icon folder; keep it in step with
+/// the icon built into this version (updates replace only the binary).
+fn refresh_menu_icon() {
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let path = std::path::Path::new(&home).join(".local/share/icons/hicolor/256x256/apps/lindesk.png");
+    let embedded = include_bytes!("../../assets/icon.png");
+    if path.exists() && std::fs::read(&path).is_ok_and(|b| b != embedded) {
+        let _ = std::fs::write(&path, embedded);
+    }
+}
+
 pub fn run() -> anyhow::Result<()> {
+    refresh_menu_icon();
     // Hybrid-GPU laptops: the integrated GPU is plenty for this window and does
     // not wake the discrete one that the game (or the encoder) may be using.
     if std::env::var_os("WGPU_POWER_PREF").is_none() {

@@ -2719,7 +2719,7 @@ dependencies = [
 
 [[package]]
 name = "lindesk-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2741,7 +2741,7 @@ dependencies = [
 
 [[package]]
 name = "lindesk-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2757,7 +2757,7 @@ dependencies = [
 
 [[package]]
 name = "lindesk-host"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -2775,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "lindesk-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "rand 0.8.8",
